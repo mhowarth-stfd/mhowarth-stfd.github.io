@@ -1,0 +1,256 @@
+---
+title: "218X Final Assignment Draft"
+author: "Merrick Howarth"
+date: "Dec. 5, 2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+```
+
+Bellow I have many of the graphs I intend to include in my project. Looking towards a final design I will be adding:
+
+  - a written analysis alongside the figures
+  - a layer to the map which is shaded for proportion of park area
+  - a shift of the race equity plot to a gg plot, though I am having problems with legend placement
+  - a buffer analysis of park location in San Francisco. Note I have switch my scope to only analyzing San Francisco because if I add this element of analysis I only have the park location data for San Francisco.
+  
+I am also considering adding another graph but cannot decide where to effectively add one.
+
+It has also occurred to me that cultural neighborhoods may be a confounding variable in my analysis, but I am not sure if that is something that can be influenced.
+
+```{r, libraries}
+
+library(tidyverse)
+library(plotly)
+library(sf)
+library(tigris)
+library(leaflet)
+library(censusapi)
+
+library(mapview)
+
+Sys.setenv(CENSUS_KEY="dbcdeeed2f9e907f31811ee78c1f239a2aa77934")
+
+
+```
+
+```{r, geospatialdata, include = F}
+
+sf_tracts_10 <- tracts("CA", "San Francisco", 2010) # using 2010 tracts b/c 2018 park data is in 2010 tracts
+
+# park data from https://www.openicpsr.org/openicpsr/project/117921/version/V1/view;jsessionid=C76AD809A54A43E205B0ACC31D208C39
+park_data_10 <- read_csv("data/nanda_parks_tract_2018_01P.csv") %>% 
+  rename(propPark = prop_park_area_tract,
+         GEOID = tract_fips10) 
+
+# joinin parks and tract data by tract id
+sf_parks <- left_join(sf_tracts_10,park_data_10) %>% rename(tract = TRACTCE)
+
+
+# identifying park proportion quartiles for san fracisco tracts
+propPark_Qs <- quantile(sf_parks$propPark, na.rm = T)
+
+sf_parks <- sf_parks %>%
+  mutate(
+    propPark_Q = case_when(
+      propPark > propPark_Qs[4] ~ 4,
+      propPark > propPark_Qs[3] ~ 3,
+      propPark > propPark_Qs[2] ~ 2,
+      propPark >= propPark_Qs[1] ~ 1
+    )
+  )
+
+
+
+```
+
+I believe the park data I am using is tied to 2010 tracts even though it is from 2018, so I wanted to prove the tracts were the same before using data interchangeably with 2010 and 2020 tracts. The area differential between these two tracts is 0 m^2 .
+
+
+```{r, show tracts are same}
+sf_tracts_20 <- tracts("CA", "San Francisco", 2020)
+
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  addPolygons(
+    data = sf_tracts_10,
+    stroke = T,
+    opacity = 0.5,
+    fill = F
+  ) %>% 
+  addPolygons(
+    data = sf_tracts_20,
+    color = "red",
+    stroke = T,
+    opacity = 0.5,
+    weight = 1,
+    fill = F
+  )
+
+
+area_check <- sf_tracts_10 %>% 
+  st_transform(26910) %>% 
+  mutate(area_10 = st_area(.)) %>%
+  
+  left_join(sf_tracts_20 %>%
+              st_transform(26910) %>%
+              mutate(area_20 = st_area(.)) %>% 
+              st_drop_geometry() %>% 
+              select(GEOID, area_20)) %>%
+  
+  mutate(delta = area_20 - area_10)
+
+tract_area_dif <- sum(area_check$delta)
+  
+# add quartile layer?
+```
+
+
+
+```{r, tract_income}
+
+# acs_vars_2019_5yr <-
+#   listCensusMetadata(
+#     name = "2019/acs/acs5",
+#     type = "variables"
+#   )
+# saveRDS(acs_vars_2019_5yr,"data/acs_vars_2019_5yr.rds")
+acs_vars_2019_5yr <- read_rds("data/acs_vars_2019_5yr.rds")
+
+
+census_race_categories <- 
+  c(
+    "White Alone",
+    "Black or African American",
+    "American Indian and Alaska Native Alone",
+    "Asian Alone",
+    "Native Hawaiian and Other Pacific Islander Alone",
+    "Some Other Race Alone",
+    "Two or More Races"
+  )
+
+sf_income_race_parkQ <-
+  1:7 %>% 
+  map_dfr(function(x){
+    getCensus(
+      name = "acs/acs5",
+      vintage = 2019,
+    region = "tract:*",
+    regionin = "state:06+county:075",
+      vars = paste0("group(B19001",LETTERS[x],")")
+    ) %>%
+      select(!c(GEO_ID,state,NAME,county) & !ends_with(c("EA","MA","M"))) %>%
+      pivot_longer(
+        ends_with("E"),
+        names_to = "name",
+        values_to = "estimate"
+      ) %>%
+      left_join(
+        acs_vars_2019_5yr %>% 
+          select(name, label)
+      ) %>% 
+      select(-name) %>% 
+      separate(
+        label,
+        into = c(NA,NA,"income"),
+        sep = "!!"
+      ) %>% 
+      filter(!is.na(income)) %>% 
+      mutate(race = census_race_categories[x])
+  }
+  ) %>%
+  
+  left_join(sf_parks %>% select(tract, propPark_Q)) %>%
+  
+  mutate(propPark_Q = as.character(propPark_Q))
+
+
+# reordering by quartile for plotting purposes
+
+sf_income_race_parkQ <- sf_income_race_parkQ %>% arrange(desc(propPark_Q))
+
+```
+
+
+```{r, equity plot race}
+
+sf_race_total <-
+  sf_income_race_parkQ %>% 
+  group_by(race) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  mutate(income = "Total Pop.", propPark_Q = "Total Pop.") 
+
+sf_park_race_gg <- sf_income_race_parkQ %>% 
+  group_by(propPark_Q, race) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  rbind(sf_race_total) %>% 
+  ggplot() +
+  geom_bar(
+    aes(
+      x = propPark_Q %>% factor(levels = rev(c("Total Pop.",unique(sf_income_race_parkQ$propPark_Q)))),
+      y = estimate,
+      fill = race %>% factor(levels = rev(unique(sf_income_race_parkQ$race)))
+    ),
+    stat = "identity",
+    position = "fill"
+  ) +
+  labs(
+    x = "Park Quartile",
+    y = "Proportion of households",
+    title = "San Francisco Park Proportion of Tract by Race",
+    fill = "Race of householder"
+  ) +
+  coord_flip() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "vertical"
+  )
+
+sf_park_race <- ggplotly(sf_park_race_gg, tooltip="y") %>% layout(legend = list(x = 200, y = 0.5))
+
+sf_park_race_gg
+
+```
+
+
+```{r, equity plot income}
+
+sf_income_total <-
+  sf_income_race_parkQ %>% 
+  group_by(income) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  mutate(race = "Total Pop.", propPark_Q = "Total Pop.") 
+
+
+sf_park_income_gg <- sf_income_race_parkQ %>% 
+  group_by(propPark_Q, income) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  rbind(sf_income_total) %>% 
+  ggplot() +
+  geom_bar(
+    aes(
+      x = propPark_Q %>% factor(levels = rev(c("Total Pop.",unique(sf_income_race_parkQ$propPark_Q)))),
+      y = estimate,
+      fill = income %>% factor(levels = rev(unique(sf_income_race_parkQ$income)))
+    ),
+    stat = "identity",
+    position = "fill"
+  ) +
+  labs(
+    x = "Park Quartile",
+    y = "Proportion of Households",
+    title = "San Francisco Park Proportion of Tract by Household Income",
+    fill = "Household Income Bracket"
+  ) 
+
+sf_park_income <- ggplotly(sf_park_income_gg, tooltip="y")
+
+sf_park_income
+
+```
+
